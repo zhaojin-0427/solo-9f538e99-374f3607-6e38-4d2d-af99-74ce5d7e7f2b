@@ -1,4 +1,4 @@
-"""FastAPI entry point for the attribution analysis service."""
+"""FastAPI entry point for the conversion-prediction sample batch service."""
 
 from __future__ import annotations
 
@@ -10,26 +10,25 @@ from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .db import Database
-from .models import ApiError, AttributeRequest
+from .models import ApiError, EventBatchRequest, OpenBatchRequest
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-DEFAULT_DB_PATH = os.environ.get("ATTRIBUTION_DB_PATH", "data/attribution.db")
-MAX_BODY_BYTES = int(os.environ.get("ATTRIBUTION_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
+DEFAULT_DB_PATH = os.environ.get("SAMPLE_BATCH_DB_PATH", "data/sample_batch.db")
+MAX_BODY_BYTES = int(
+    os.environ.get("SAMPLE_BATCH_MAX_BODY_BYTES", str(16 * 1024 * 1024))
+)
+# Excel opens UTF-8 CSV correctly when the BOM is present.
+CSV_BOM = "﻿"
 
 
 class BodySizeLimitMiddleware:
-    """Reject request bodies above a byte limit with a structured 413.
-
-    The body is buffered up to the limit (bounded, so memory use is capped)
-    and replayed downstream.  This also covers chunked requests without a
-    Content-Length header.
-    """
+    """Reject request bodies above a byte limit with a structured 413."""
 
     def __init__(self, app: ASGIApp, max_bytes) -> None:
         self.app = app
@@ -92,7 +91,7 @@ class BodySizeLimitMiddleware:
             {
                 "error": {
                     "code": "payload_too_large",
-                    "message": f"请求体过大，请拆分后重试。 上限为 {limit} 字节。",
+                    "message": f"请求体过大，请拆分后重试。上限为 {limit} 字节。",
                     "details": [],
                 }
             },
@@ -123,11 +122,11 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             database.close()
 
     app = FastAPI(
-        title="运营归因分析",
+        title="成交预测样本批次服务",
         version="1.0.0",
         description=(
-            "按用户接收触点与转化事件，在归因窗口和触点容量约束下"
-            "最大化已归因转化数，并返回可解释的匹配链。"
+            "按受理快照冻结观察窗口：开批固定名单与七日内分渠道触点特征，"
+            "到期结批生成每用户一行的成交标签 CSV。"
         ),
         lifespan=lifespan,
     )
@@ -173,7 +172,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             content={
                 "error": {
                     "code": "invalid_payload",
-                    "message": "请求校验失败，整批事件均未被处理。",
+                    "message": "请求校验失败，整批请求均未被处理。",
                     "details": details,
                 }
             },
@@ -191,22 +190,54 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             content={"status": "ok" if healthy else "degraded"},
         )
 
-    @app.post("/attribute", tags=["attribution"])
-    def attribute(payload: AttributeRequest) -> dict:
-        return database.ingest(payload)
+    # -- event ingestion ----------------------------------------------------
 
-    @app.get("/api/users", tags=["attribution"])
+    @app.post("/api/events", tags=["events"])
+    def submit_events(payload: EventBatchRequest) -> dict:
+        return database.ingest_events(payload)
+
+    @app.get("/api/users", tags=["events"])
     def list_users() -> dict:
         users = database.list_users()
         return {"users": users, "count": len(users)}
 
-    @app.get("/api/users/{user_id}/attribution", tags=["attribution"])
-    def user_attribution(user_id: str) -> dict:
-        return database.get_attribution(user_id)
-
-    @app.get("/api/users/{user_id}/events", tags=["attribution"])
+    @app.get("/api/users/{user_id}/events", tags=["events"])
     def user_events(user_id: str) -> dict:
         return database.get_user_events(user_id)
+
+    # -- batch lifecycle ----------------------------------------------------
+
+    @app.post("/api/batches", tags=["batches"], status_code=201)
+    def open_batch(payload: OpenBatchRequest) -> dict:
+        return database.open_batch(
+            user_ids=payload.user_ids,
+            observation_minutes=payload.observation_minutes,
+        )
+
+    @app.get("/api/batches", tags=["batches"])
+    def list_batches() -> dict:
+        batches = database.list_batches()
+        return {"batches": batches, "count": len(batches)}
+
+    @app.get("/api/batches/{batch_id}", tags=["batches"])
+    def get_batch(batch_id: str) -> dict:
+        return database.get_batch(batch_id)
+
+    @app.post("/api/batches/{batch_id}/close", tags=["batches"])
+    def close_batch(batch_id: str) -> dict:
+        return database.close_batch(batch_id)
+
+    @app.get("/api/batches/{batch_id}/csv", tags=["batches"])
+    def download_batch_csv(batch_id: str) -> Response:
+        csv_text, filename = database.download_csv(batch_id)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        }
+        return Response(
+            content=CSV_BOM + csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers=headers,
+        )
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app

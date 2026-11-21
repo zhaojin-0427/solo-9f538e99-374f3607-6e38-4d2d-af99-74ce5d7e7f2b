@@ -1,15 +1,15 @@
 services:
-  attribution:
+  sample-batch:
     build: .
-    image: attribution-app:local
-    container_name: attribution-app
+    image: sample-batch-app:local
+    container_name: sample-batch-app
     ports:
-      - "${ATTRIBUTION_PORT:-8000}:8000"
+      - "${SAMPLE_BATCH_PORT:-8000}:8000"
     environment:
-      ATTRIBUTION_DB_PATH: /data/attribution.db
-      ATTRIBUTION_MAX_BODY_BYTES: "16777216"
+      SAMPLE_BATCH_DB_PATH: /data/sample_batch.db
+      SAMPLE_BATCH_MAX_BODY_BYTES: "16777216"
     volumes:
-      - attribution_data:/data
+      - sample_batch_data:/data
     restart: unless-stopped
     healthcheck:
       test:
@@ -23,4 +23,4 @@ services:
       start_period: 5s
 
 volumes:
-  attribution_data:
+  sample_batch_data:

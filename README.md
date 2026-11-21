@@ -1,22 +1,30 @@
-# 运营归因分析台
+# 成交预测样本批次台
 
-FastAPI + SQLite 的运营数据分析 Web 应用：接收同一用户的触点与转化事件，
-在**归因窗口**与**每个触点的承接上限**约束下做归因匹配。
+FastAPI + SQLite 的样本工程服务：分析员在首页选择**已入库用户**、填写**观察分钟数**
+开批；观察期到期后按批号结批，系统发布一份每用户一行的完整 CSV，包含各渠道
+触点数与成交标签（有成交 = 1，否则 = 0）。
 
-## 功能
+## 核心快照语义
 
-- **按用户接收事件**：网页表单或 `POST /attribute` 提交 `touchpoints` / `conversions`。
-- **合法触点**：只有发生在转化**之前**、且在归因窗口内的触点才可参与匹配。
-- **最大化归因**：在触点容量约束下先最大化已归因转化数；在最大解集合中，
-  按触点**优先级高 → 时间更新 → ID 升序**的偏好稳定决胜（最小代价最大流）。
-- **可解释结果**：每个转化给出归因触点或未归因原因
-  （`no_eligible_touchpoint` / `capacity_exhausted`）、窗口内候选触点、
-  时间差；并提供触点余量与渠道汇总。
-- **幂等写入**：事件按 `(user_id, event_id)` 去重；内容一致重复提交只计为
-  忽略，内容冲突整批拒绝（409）。
-- **整批校验**：任一字段非法（时间、类型、负数、未知字段、空批次等）则
-  整批 422 拒绝，不写入任何数据。
-- **页面查看**：单页应用可浏览历史用户、转化明细、匹配链时间轴、触点容量和渠道汇总。
+系统不依赖"当前数据"重新计算样本，所有范围在受理时刻冻结：
+
+- **开批即冻结**：开批事务内固定名单、观察起点（开批受理时刻）与观察终点
+  （起点 + 观察分钟数），并一次性算好每个用户在各渠道的触点数。
+- **触点特征窗口**：只统计开批受理时**已入库**、且事件发生在此前 **7 天**
+  `[开批时刻 - 7天, 开批时刻]`（两端都含）的触点，按用户 × 渠道计数。
+  之后才入库的触点即使发生在这 7 天内，也**不会补进**样本特征。
+- **结批标签窗口**：到期后按批号结批，只统计**首次受理结批时已入库**、且成交
+  发生在观察期 `[观察起点, 观察终点)`（含起点、不含终点）的成交。有成交标 1，
+  否则标 0。结批受理之后才入库的成交不改变标签。
+- **受理时钟严格递增**：每次入库 / 开批 / 结批受理在事务内取一个带单调后缀的
+  提交时刻（`commit_clock` 表），即使墙钟在同一微秒或被冻结，"已入库"的先后
+  判定也是确定的。
+- **失败与并发安全**：结批是状态机上的比较并置（open → closing → published /
+  failed）。并发结批由同进程锁串行化，所有调用者拿到同一份结果；生成失败可
+  重试，重试沿用**首次受理**的 `first_close_at`，范围不变；进程重启后遇到遗留的
+  `closing` 状态也会沿用原受理时间继续完成。
+- **唯一 CSV**：同一批号只发布一份完整 CSV，原样存库、按批号下载，重复下载字节
+  一致。生成样本期间新事件仍可正常提交入库，互不阻塞。
 
 ## 启动
 
@@ -27,13 +35,13 @@ docker compose up --build
 # 打开 http://localhost:8000
 ```
 
-数据保存在命名卷 `attribution_data` 中（容器内 `/data/attribution.db`），
+数据保存在命名卷 `sample_batch_data`（容器内 `/data/sample_batch.db`），
 `docker compose down` 不会删除数据；需要清空时执行 `docker compose down -v`。
 
 默认端口 8000，可通过环境变量覆盖：
 
 ```bash
-ATTRIBUTION_PORT=8080 docker compose up --build
+SAMPLE_BATCH_PORT=8080 docker compose up --build
 ```
 
 ### 本地运行
@@ -47,83 +55,88 @@ uvicorn app.main:app --reload
 ### 测试
 
 ```bash
-pip install pytest httpx
+pip install -r requirements.txt httpx pytest
 python3 -m pytest
 ```
 
+测试用可冻结时钟（`tests/conftest.py`）确定性地验证窗口边界、迟到数据、
+并发结批、失败重试与重启恢复。
+
+## 页面用法
+
+1. **提交事件**：粘贴同一用户的触点 / 成交 JSON 并提交，事件以受理时刻入库。
+2. **开批**：勾选一个或多个已入库用户，填写观察分钟数后开批。名单不存在的用户
+   会被整批拒绝（404）。
+3. **结批与下载**：批次列表展示状态与观察起止时刻；到期前结批返回 409
+   `batch_not_due`；到期后点"结批"，发布后可下载 `{批号}.csv`。
+
 ## API
 
-### `POST /attribute`
+### `POST /api/events` — 提交一批已受理事件
 
 ```json
 {
   "user_id": "u_1001",
-  "attribution_window_seconds": 604800,
-  "default_touch_capacity": 1,
   "touchpoints": [
-    {"id": "tp1", "occurred_at": "2026-11-01T09:00:00Z", "channel": "搜索广告", "priority": 3, "capacity": 2},
-    {"id": "tp2", "occurred_at": "2026-11-02T10:00:00Z", "channel": "社交媒体", "priority": 2}
+    {"id": "tp1", "occurred_at": "2026-11-20T09:00:00Z", "channel": "搜索广告"},
+    {"id": "tp2", "occurred_at": "2026-11-20T15:00:00Z", "channel": "社交媒体"}
   ],
   "conversions": [
-    {"id": "cv1", "occurred_at": "2026-11-03T12:00:00Z", "value": 199}
+    {"id": "cv1", "occurred_at": "2026-11-21T12:20:00Z"}
   ]
 }
 ```
 
-字段说明：
+- 触点字段：`id`、`occurred_at`（ISO 8601，无时区按 UTC）、`channel`。
+- 成交字段：`id`、`occurred_at`。
+- `(user_id, event_id)` 幂等：内容一致的重复提交只计 `duplicates_ignored`；
+  同 ID 内容冲突整批 409 `event_id_conflict`，不写入任何数据。
+- 任一字段非法或批次为空，整批 422 拒绝。
 
-| 字段 | 说明 |
-| --- | --- |
-| `user_id` | 非空字符串，事件集合按用户隔离 |
-| `attribution_window_seconds` | 归因窗口（秒），正整数；合法区间为 `[转化时间 - 窗口, 转化时间)`，恰好等于窗口下界也算命中，与转化同一时刻的触点不算“此前” |
-| `default_touch_capacity` | 未显式设置 `capacity` 的触点默认承接上限，非负整数 |
-| `touchpoints[].id` | 触点在用户内唯一的事件 ID |
-| `touchpoints[].occurred_at` | ISO 8601；无时区按 UTC 处理 |
-| `touchpoints[].channel` | 渠道名，非空 |
-| `touchpoints[].priority` | 整数，越大越优先，默认 0 |
-| `touchpoints[].capacity` | 该触点最多承接的转化数，`null` 表示使用默认容量 |
-| `conversions[].value` | 非负有限数字，默认 0 |
+### `POST /api/batches` — 开批
 
-响应核心结构：
+```json
+{"user_ids": ["u_1001", "u_1002"], "observation_minutes": 60}
+```
+
+响应包含批号、状态、观察起止时刻、渠道清单与每个用户冻结的特征：
 
 ```json
 {
-  "user_id": "u_1001",
-  "settings": {"attribution_window_seconds": 604800, "default_touch_capacity": 1},
-  "totals": {"conversions": 6, "attributed_conversions": 4, "unattributed_conversions": 2, "attributed_value": 398.0},
-  "unattributed_reasons": {"no_eligible_touchpoint": 1, "capacity_exhausted": 1},
-  "conversions": [
-    {
-      "conversion_id": "cv1",
-      "attributed": true,
-      "touchpoint_id": "tp3",
-      "channel": "邮件",
-      "time_gap_seconds": 14400.0,
-      "reason": null,
-      "eligible_touchpoints": [{"touchpoint_id": "tp3", "selected": true, "...": "..."}]
-    }
-  ],
-  "touchpoints": [{"touchpoint_id": "tp3", "capacity": 1, "used": 1, "remaining": 0}],
-  "channels": [{"channel": "邮件", "attributed_conversions": 1, "attributed_value": 199.0}],
-  "received": {"inserted": 4, "duplicates_ignored": 0}
+  "batch_id": "B000001",
+  "status": "open",
+  "observation_start": "2026-11-21T12:00:00.000000Z",
+  "observation_end":   "2026-11-21T13:00:00.000000Z",
+  "channels": ["搜索广告", "社交媒体"],
+  "members": [
+    {"user_id": "u_1001", "features": {"搜索广告": 2, "社交媒体": 1}}
+  ]
 }
 ```
 
-重复提交同一批次：
-
-- 内容完全一致：返回 200，`inserted=0`，`duplicates_ignored` 为重复条数；
-- 同一 ID 对应不同内容：返回 409 `event_id_conflict`，整批不写入。
-
-### 其他端点
+### 结批与下载
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/` | 单页 Web 界面 |
-| `GET` | `/health` | 健康检查 |
-| `GET` | `/api/users` | 已保存用户列表 |
-| `GET` | `/api/users/{user_id}/attribution` | 按已保存数据重新计算并返回归因结果 |
-| `GET` | `/api/users/{user_id}/events` | 该用户已保存的原始事件 |
-| `GET` | `/docs` | 自动生成的 OpenAPI 文档 |
+| `POST` | `/api/batches/{batch_id}/close` | 到期结批；幂等，重试 / 并发 / 重启均沿用首次受理范围 |
+| `GET`  | `/api/batches/{batch_id}/csv` | 下载唯一 CSV（UTF-8 带 BOM，Excel 可直接打开） |
+| `GET`  | `/api/batches` | 批次列表 |
+| `GET`  | `/api/batches/{batch_id}` | 批次详情（含冻结特征） |
+| `GET`  | `/api/users` | 已入库用户 |
+| `GET`  | `/api/users/{user_id}/events` | 用户原始事件 |
+| `GET`  | `/health` | 健康检查 |
+
+发布后的 CSV 形如：
+
+```csv
+user_id,搜索广告,社交媒体,label
+u_1001,2,1,1
+u_1002,0,1,0
+```
+
+- 渠道列取开批时所有成员出现过的渠道并按名称排序；某用户没有该渠道触点则补 0。
+- 每个名单用户恰好一行，行顺序按 `user_id` 排序。
+- 未发布时下载返回 409 `batch_not_published`。
 
 ### 错误格式
 
@@ -131,39 +144,30 @@ python3 -m pytest
 {
   "error": {
     "code": "invalid_payload",
-    "message": "请求校验失败，整批事件均未被处理。",
-    "details": [{"field": "body.conversions.0.value", "message": "..."}]
+    "message": "请求校验失败，整批请求均未被处理。",
+    "details": [{"field": "body.user_ids", "message": "..."}]
   }
 }
 ```
 
 常见错误码：`invalid_payload`（422）、`duplicate_event_id`（422）、
-`candidate_space_too_large`（422）、`payload_too_large`（413）、
-`event_id_conflict`（409）、`user_not_found`（404）。
+`event_id_conflict`（409）、`user_not_found`（404）、`batch_not_found`（404）、
+`batch_not_due`（409）、`batch_not_published`（409）、
+`batch_generation_failed`（500，可安全重试）、`payload_too_large`（413）。
 
-## 匹配算法
+## 数据模型与持久化
 
-将问题建模为**带容量的二分匹配**：
-
-1. 源点 → 每个转化（容量 1）；
-2. 转化 → 合法触点（转化之前且窗口内，容量 1，代价为该触点的偏好名次）；
-3. 触点 → 汇点（容量为触点的承接上限，代价 0）。
-
-求解**最小费用最大流**（逐次最短增广路 + Johnson 势函数）。最大流值即最大化
-已归因转化数；在最大解中最小化总偏好名次，等价于优先使用高优先级、更新、
-ID 更小的触点。算法结果完全确定，同一输入重复计算得到同一匹配。
-
-为保护服务，单次请求的候选连接数超过 120,000 时返回 422，建议缩小窗口或拆分
-事件批次。
+- SQLite（WAL 模式），所有写操作走 `BEGIN IMMEDIATE`，幂等检查与插入、
+  快照读取与批次落库都在同一事务内原子完成。
+- `events.ingested_at` 记录受理提交时刻；批次表保存开批 / 首次结批受理时刻、
+  冻结的渠道清单、成员特征 JSON 与最终 CSV 文本，重启后状态完整可恢复。
+- 结批状态机：`open → closing → published`，生成异常置 `failed` 并保留原
+  `first_close_at`，重试回到 `closing` 继续。
 
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `ATTRIBUTION_DB_PATH` | `data/attribution.db` | SQLite 文件路径 |
-| `ATTRIBUTION_MAX_BODY_BYTES` | `16777216` | 请求体上限（字节） |
-
-## 并发与持久化
-
-- SQLite 开启 WAL；写入使用 `BEGIN IMMEDIATE` 事务，幂等检查与插入原子完成。
-- 事件、设置与幂等哈希在同一个事务中落库；校验或冲突失败时整批回滚。
+| `SAMPLE_BATCH_DB_PATH` | `data/sample_batch.db` | SQLite 文件路径 |
+| `SAMPLE_BATCH_MAX_BODY_BYTES` | `16777216` | 请求体上限（字节） |
+| `SAMPLE_BATCH_PORT` | `8000` | 仅 compose 端口映射使用 |

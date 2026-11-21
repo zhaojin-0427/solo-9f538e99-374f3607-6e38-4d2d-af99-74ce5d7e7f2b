@@ -1,10 +1,9 @@
-"""Request models and strict validation for the attribution API."""
+"""Request models and strict validation for the sample-batch service."""
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 
 from pydantic import (
     BaseModel,
@@ -17,8 +16,12 @@ from pydantic import (
 
 
 MAX_EVENTS_PER_BATCH = 5_000
-MAX_WINDOW_SECONDS = 10 * 365 * 24 * 60 * 60
-MAX_CAPACITY = 1_000_000
+MAX_BATCH_USERS = 2_000
+# Observation windows longer than ~10 years are almost certainly client bugs.
+MAX_OBSERVATION_MINUTES = 10 * 365 * 24 * 60
+# The feature look-back is fixed by the product spec at seven days.
+FEATURE_LOOKBACK_DAYS = 7
+FEATURE_LOOKBACK_SECONDS = FEATURE_LOOKBACK_DAYS * 24 * 60 * 60
 
 
 def parse_timestamp(value: object) -> datetime:
@@ -51,10 +54,6 @@ class TouchpointIn(StrictModel):
     id: str = Field(min_length=1, max_length=200)
     occurred_at: datetime
     channel: str = Field(min_length=1, max_length=100)
-    # Higher numbers are preferred. Default 0 keeps the field optional.
-    priority: StrictInt = Field(default=0, ge=-(2**31), le=2**31 - 1)
-    # None means "use the request-level default capacity".
-    capacity: Optional[StrictInt] = Field(default=None, ge=0, le=MAX_CAPACITY)
 
     @field_validator("occurred_at", mode="before")
     @classmethod
@@ -65,54 +64,53 @@ class TouchpointIn(StrictModel):
 class ConversionIn(StrictModel):
     id: str = Field(min_length=1, max_length=200)
     occurred_at: datetime
-    value: float = Field(default=0.0, ge=0)
 
     @field_validator("occurred_at", mode="before")
     @classmethod
     def _validate_occurred_at(cls, value: object) -> datetime:
         return parse_timestamp(value)
 
-    @field_validator("value", mode="before")
-    @classmethod
-    def _validate_value(cls, value: object) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("value 必须是数字")
-        number = float(value)
-        if not math.isfinite(number) or number < 0:
-            raise ValueError("value 必须是有限的非负数")
-        return number
 
+class EventBatchRequest(StrictModel):
+    """A submitted, committed snapshot of one user's events."""
 
-class AttributeRequest(StrictModel):
     user_id: str = Field(min_length=1, max_length=200)
-    attribution_window_seconds: StrictInt = Field(
-        gt=0, le=MAX_WINDOW_SECONDS, description="归因窗口长度（秒）"
-    )
-    default_touch_capacity: StrictInt = Field(
-        default=1,
-        ge=0,
-        le=MAX_CAPACITY,
-        description="未显式声明 capacity 的触点的默认承接上限",
-    )
     touchpoints: List[TouchpointIn] = Field(max_length=MAX_EVENTS_PER_BATCH)
     conversions: List[ConversionIn] = Field(max_length=MAX_EVENTS_PER_BATCH)
 
     @model_validator(mode="after")
-    def _require_events(self) -> "AttributeRequest":
+    def _require_events(self) -> "EventBatchRequest":
         if not self.touchpoints and not self.conversions:
-            raise ValueError("批次至少需要包含一个触点或转化事件")
+            raise ValueError("批次至少需要包含一个触点或成交事件")
         return self
 
 
+class OpenBatchRequest(StrictModel):
+    user_ids: List[str] = Field(min_length=1, max_length=MAX_BATCH_USERS)
+    observation_minutes: StrictInt = Field(gt=0, le=MAX_OBSERVATION_MINUTES)
+
+    @field_validator("user_ids")
+    @classmethod
+    def _validate_user_ids(cls, value: List[str]) -> List[str]:
+        cleaned = [item.strip() for item in value]
+        if any(not item for item in cleaned):
+            raise ValueError("user_ids 不能包含空字符串")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("user_ids 不能重复")
+        if any(len(item) > 200 for item in cleaned):
+            raise ValueError("单个 user_id 长度不能超过 200")
+        return cleaned
+
+
 class ApiError(Exception):
-    """An expected API-level error that should be rendered as structured JSON."""
+    """An expected API-level error rendered as structured JSON."""
 
     def __init__(
         self,
         status_code: int,
         code: str,
         message: str,
-        errors: Optional[List[dict]] = None,
+        errors: List[dict] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -123,12 +121,12 @@ class ApiError(Exception):
 
 __all__ = [
     "ApiError",
-    "AttributeRequest",
     "ConversionIn",
-    "MAX_CAPACITY",
+    "EventBatchRequest",
+    "FEATURE_LOOKBACK_SECONDS",
+    "MAX_BATCH_USERS",
     "MAX_EVENTS_PER_BATCH",
-    "MAX_WINDOW_SECONDS",
-    "StrictModel",
+    "OpenBatchRequest",
     "TouchpointIn",
     "parse_timestamp",
 ]
